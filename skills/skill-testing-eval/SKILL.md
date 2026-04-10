@@ -8,17 +8,134 @@ user-invocable: true
 
 > 来源：对 Claude Code SkillTool (1108行)、loadSkillsDir (1086行)、bundledSkills 等核心模块的逆向分析。
 
-## 一、核心发现：Claude Code 没有内置 Skill 测试框架
+## 一、Anthropic 的真实验证体系：不是没有测试，而是测试范式不同
 
-源码中 skill 的"测试"仅限于：
+### 源码中可见的验证机制
+
+源码中 skill 层面的验证确实有限：
 - frontmatter 的 `HooksSchema().safeParse()` 校验 hooks 格式
 - `findCommand()` 的名称/别名精确匹配
 - `meetsAvailabilityRequirement()` 检查 feature gate
 - Safe properties allowlist 决定是否免权限
 
-**没有**：单元测试、集成测试、回归测试、效果评估。这意味着你必须自建。
+表面上看**没有**传统意义上的单元测试、集成测试框架。但这个结论需要辩证来看。
 
-## 二、Skill 测试四层体系
+### Boris Cherny（Claude Code 创始人）公开披露的验证体系
+
+从泄露代码和 Boris 的公开分享来看，Anthropic 的工程验证其实是多层次的，只是和传统单元测试思路完全不同：
+
+**1. CLAUDE.md 作为"活的回归规则库"**
+
+团队共享一个 CLAUDE.md 文件，签入 git，全团队每周贡献多次。每当发现 Claude 做错了什么，就加到 CLAUDE.md 里，让 Claude 下次不再犯同样的错。
+
+这本质上是把回归测试变成了**规则积累**——不是测某个函数的输出，而是约束 AI agent 的行为边界。源码验证了这一点：`getUserContext()` 在每次会话启动时加载 CLAUDE.md 到 system context，并参与 prompt cache。
+
+```
+传统回归测试:  assert(fn(input) === expectedOutput)
+CLAUDE.md 回归: "当遇到 X 场景时，永远不要做 Y，因为上次做了导致 Z"
+```
+
+**2. 可观测性优先于传统测试**
+
+Boris 在访谈中解释了为什么代码本身不是最重要的——Anthropic 在构建的不只是写代码的系统，还有**监控代码变更效果的可观测性系统**。思路是：与其逐行写单测，不如建一套系统能在问题发生时自动发现并回滚。
+
+源码中的证据：
+- `logForDiagnosticsNoPII()` 遍布关键路径，零 PII 的结构化日志
+- `tengu_skill_tool_invocation` 遥测事件记录每次 skill 调用的详细数据
+- GrowthBook feature flags 支持灰度发布 + 快速回滚
+- 启动性能采样（0.5% 外部用户 + 100% 内部）
+
+**3. "VerifyApp" 子代理做端到端验证**
+
+Boris 常用的子代理之一叫 VerifyApp，包含详细的端到端测试指令，专门测试 Claude Code 本身。源码中也有对应机制：
+- `TaskUpdateTool` 中的 verification agent nudge：完成 3+ 个任务但没有验证时，系统提示创建 verification agent
+- 源码注释：*"only the verifier issues a verdict"*——Worker 不能自我验证
+- `TaskCompleted` hooks 可以阻止标记完成，充当质量门禁
+
+此外，Claude Code 团队用 Chrome 扩展来测试 claude.ai/code 上的每一个改动——打开浏览器、测试 UI、反复迭代直到代码和体验都没问题。
+
+**4. Post-tool-use Hook 做格式守卫**
+
+团队用 `PostToolUse` hook 在 Claude 编辑代码后自动格式化。Claude 通常生成的代码格式已经不错，hook 处理最后 10% 以避免 CI 中的格式错误。
+
+源码验证：hooks.ts (159KB) 实现了完整的 `PreToolUse` / `PostToolUse` / `PostToolUseFailure` 生命周期。
+
+### 总结：验证范式的转变
+
+```
+传统软件验证:
+  单元测试 → 集成测试 → E2E 测试 → 人工 QA
+
+AI Agent 验证 (Anthropic 模式):
+  CLAUDE.md 规则约束     → 行为边界回归
+  + 可观测性 + 灰度发布  → 问题自动发现 + 快速回滚
+  + AI 子代理端到端验证   → VerifyApp / verification agent
+  + CI Hook 格式守卫     → PostToolUse 自动修正
+```
+
+**不是"没有验证"，而是验证方式从"写测试断言"转向了"规则约束 + 可观测性 + AI 子代理验证 + CI hook"的组合。**
+
+那么对于我们自己的 skill 工程，该怎么做？下面的体系融合了两种思路。
+
+## 二、实战 Skill 验证体系（融合 Anthropic 模式 + 传统测试）
+
+### Layer 0: CLAUDE.md 规则积累（Anthropic 核心模式，零边际成本）
+
+这是 Anthropic 团队最依赖的验证方式。每次 skill 产生了不好的结果，不是去写测试用例，而是在 CLAUDE.md 中加一条规则：
+
+```markdown
+# CLAUDE.md (项目级)
+
+## Skill 行为约束（团队共建，持续积累）
+
+### /refactor skill
+- 不要重命名已导出的公共 API（破坏下游消费者）
+- 不要把多个小函数合并成一个大函数（违反单一职责）
+- 重构后必须运行 npm test，不通过则回滚
+
+### /code-review skill  
+- 不要给出"looks good"式的空洞评价
+- 必须检查：错误处理、边界条件、类型安全
+- 对 any 类型使用必须提出替代方案
+
+### /fix-bug skill
+- 先写测试复现 bug，再修复
+- 修复范围不超过 bug 直接相关的代码
+- 不要顺手重构"看起来不好"的周边代码
+```
+
+**为什么这有效**：
+- CLAUDE.md 在每次会话启动时加载到 system prompt，参与 prompt cache
+- 规则是**增量积累**的——团队每个人都可以贡献
+- 本质是用自然语言描述的**行为回归测试**
+- 零额外成本（不需要跑测试，规则在每次调用时自动生效）
+
+### Layer 0.5: PostToolUse Hook 自动守卫（CI 级别）
+
+```json
+// ~/.claude/settings.json
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "command": "npx prettier --write $TOOL_OUTPUT_PATH 2>/dev/null; npx eslint --fix $TOOL_OUTPUT_PATH 2>/dev/null || true"
+      }
+    ],
+    "TaskCompleted": [
+      {
+        "command": "bash -c 'npm test --silent || echo {\"blockingError\": \"Tests failed, cannot mark complete\"}'"
+      }
+    ]
+  }
+}
+```
+
+**效果**：
+- 每次 Edit/Write 后自动格式化（处理 Claude 输出的最后 10% 格式问题）
+- TaskCompleted hook 阻止在测试失败时标记任务完成（质量门禁）
+
+## 三、Skill 测试四层体系
 
 ### Layer 1: 静态校验（零成本）
 
@@ -157,7 +274,7 @@ allowed-tools: Bash, Read, Glob, Grep, Agent
 这是因为 LLM 输出不确定性——同一个 skill 两次执行结果不会完全相同。
 ```
 
-## 三、降低测试成本的技巧（来自源码洞察）
+## 四、降低测试成本的技巧（来自源码洞察）
 
 1. **用 haiku 做初筛**：skill frontmatter 支持 `model: haiku`，测试时先用便宜模型跑通流程，确认无结构性问题后再用 opus 做质量评估
 
@@ -169,7 +286,7 @@ allowed-tools: Bash, Read, Glob, Grep, Agent
 
 5. **rough estimation 预检**：源码中 `roughTokenCountEstimation` 用 4 bytes/token 估算。测试前先估算 skill 内容 + 测试用例的总 token，避免超预算
 
-## 四、Skill 质量评分维度
+## 五、Skill 质量评分维度
 
 | 维度 | 权重 | 检查方式 |
 |------|------|----------|
